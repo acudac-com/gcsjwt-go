@@ -151,14 +151,18 @@ func (g *GcsJwt[T]) Parse(ctx context.Context, signedJwt string) (T, error) {
 	}
 }
 
+// Returns the jwt claims if validation succeeds.
+// Fails if the signedJwt has the incorrect signature or is expired.
+// Strips out any 'bearer ' or 'Bearer ' prefix
+// Returns an empty claims, instead of an error, if the provided key is not found in the incoming ctx.
 func (g *GcsJwt[T]) ParseCtx(ctx context.Context, key string) (T, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return g.newClaims(), fmt.Errorf("no incoming metadata not found")
+		return g.newClaims(), nil
 	}
 	vals := md.Get(key)
 	if len(vals) == 0 {
-		return g.newClaims(), fmt.Errorf("no %s found in incoming metadata", key)
+		return g.newClaims(), nil
 	}
 	return g.Parse(ctx, vals[0])
 }

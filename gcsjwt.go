@@ -8,22 +8,24 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/golang-jwt/jwt"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/metadata"
 )
 
 var gcsClient *storage.Client
-var gcsJwt *GcsJwt
 
 // Provides functions to create and validate jwts.
 // Uses Google Cloud Storage to store the 4096 bit private RSA keys.
-type GcsJwt struct {
+type GcsJwt[T jwt.Claims] struct {
 	bucketHandle *storage.BucketHandle
 	cachedKeys   *sync.Map
+	newClaims    func() T
 }
 
 // PublicKey represents a public key
@@ -39,7 +41,7 @@ func (p *PublicKey) String() string {
 }
 
 // Returns a new GcsJwt to create and validate jwt tokens.
-func New(bucket string, opts ...option.ClientOption) (*GcsJwt, error) {
+func New[T jwt.Claims](bucket string, newClaims func() T, opts ...option.ClientOption) (*GcsJwt[T], error) {
 	// Create a new Storage client if one does not exist.
 	if gcsClient == nil {
 		ctx := context.Background()
@@ -50,51 +52,15 @@ func New(bucket string, opts ...option.ClientOption) (*GcsJwt, error) {
 	}
 
 	// Set the Storage client.
-	return &GcsJwt{
+	return &GcsJwt[T]{
 		bucketHandle: gcsClient.Bucket(bucket),
 		cachedKeys:   &sync.Map{},
+		newClaims:    newClaims,
 	}, nil
 }
 
-// Equivalent to New, but does not return the GcsJwt instance, but rather keeps it in local storage.
-// After initialisation, SignedJwt, PublicKeys and Validate can be used.
-func Init(bucket string, opts ...option.ClientOption) error {
-	var err error
-	if gcsJwt, err = New(bucket, opts...); err != nil {
-		return err
-	}
-	return nil
-}
-
 // Returns a signed jwt token with the provided claims.
-// It is higly recommended to use common claims like sub, email, iss, aud and exp.
-func SignedJwt(ctx context.Context, claims jwt.MapClaims) (string, error) {
-	if gcsJwt == nil {
-		return "", fmt.Errorf("local gcsJwt instance not yet initialised via Init")
-	}
-	return gcsJwt.SignedJwt(ctx, claims)
-}
-
-// Returns the two public keys currently in rotation.
-func PublicKeys(ctx context.Context) ([]*PublicKey, error) {
-	if gcsJwt == nil {
-		return nil, fmt.Errorf("local gcsJwt instance not yet initialised via Init")
-	}
-	return gcsJwt.PublicKeys(ctx)
-}
-
-// Returns the jwt claims if validation succeeds.
-// Fails if the signedJwt has the incorrect signature or is expired.
-func Validate(ctx context.Context, signedJwt string) (jwt.MapClaims, error) {
-	if gcsJwt == nil {
-		return nil, fmt.Errorf("local gcsJwt instance not yet initialised via Init")
-	}
-	return gcsJwt.Validate(ctx, signedJwt)
-}
-
-// Returns a signed jwt token with the provided claims.
-// It is higly recommended to use common claims like sub, email, iss, aud and exp.
-func (g *GcsJwt) SignedJwt(ctx context.Context, claims jwt.MapClaims) (string, error) {
+func (g *GcsJwt[T]) Sign(ctx context.Context, claims T) (string, error) {
 	// get the private key
 	keyId := time.Now().UTC().Format("2006-01-02")
 	keys, err := g.rsaKeys(ctx, []string{keyId})
@@ -116,7 +82,7 @@ func (g *GcsJwt) SignedJwt(ctx context.Context, claims jwt.MapClaims) (string, e
 }
 
 // Returns the two public keys currently in rotation.
-func (g *GcsJwt) PublicKeys(ctx context.Context) ([]*PublicKey, error) {
+func (g *GcsJwt[T]) PublicKeys(ctx context.Context) ([]*PublicKey, error) {
 	// determine which key ids to get based on today and yesterday
 	today := time.Now().UTC()
 	today = time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
@@ -149,9 +115,12 @@ func (g *GcsJwt) PublicKeys(ctx context.Context) ([]*PublicKey, error) {
 
 // Returns the jwt claims if validation succeeds.
 // Fails if the signedJwt has the incorrect signature or is expired.
-func (g *GcsJwt) Validate(ctx context.Context, signedJwt string) (jwt.MapClaims, error) {
-	claims := jwt.MapClaims{}
-	_, err := jwt.ParseWithClaims(signedJwt, claims, func(token *jwt.Token) (interface{}, error) {
+// Strips out any 'bearer ' or 'Bearer ' prefix
+func (g *GcsJwt[T]) Parse(ctx context.Context, signedJwt string) (T, error) {
+	signedJwt = strings.TrimPrefix(signedJwt, "bearer ")
+	signedJwt = strings.TrimPrefix(signedJwt, "Bearer ")
+	claims := g.newClaims()
+	t, err := jwt.ParseWithClaims(signedJwt, g.newClaims(), func(token *jwt.Token) (interface{}, error) {
 		// get kid from headers
 		kid, ok := token.Header["kid"].(string)
 		if !ok {
@@ -174,13 +143,28 @@ func (g *GcsJwt) Validate(ctx context.Context, signedJwt string) (jwt.MapClaims,
 		return &key[0].PublicKey, nil
 	})
 	if err != nil {
-		return nil, err
+		return claims, err
+	} else if claims, ok := t.Claims.(T); ok {
+		return claims, nil
+	} else {
+		return claims, fmt.Errorf("failed to parse claims")
 	}
-	return claims, nil
+}
+
+func (g *GcsJwt[T]) ParseCtx(ctx context.Context, key string) (T, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return g.newClaims(), fmt.Errorf("no incoming metadata not found")
+	}
+	vals := md.Get(key)
+	if len(vals) == 0 {
+		return g.newClaims(), fmt.Errorf("no %s found in incoming metadata", key)
+	}
+	return g.Parse(ctx, vals[0])
 }
 
 // Returns the bytes in the provided Google Cloud Storage object.
-func (g *GcsJwt) readObject(ctx context.Context, object string) ([]byte, error) {
+func (g *GcsJwt[T]) readObject(ctx context.Context, object string) ([]byte, error) {
 	// Create reader
 	reader, err := g.bucketHandle.Object(object).NewReader(ctx)
 	if err != nil {
@@ -194,7 +178,7 @@ func (g *GcsJwt) readObject(ctx context.Context, object string) ([]byte, error) 
 
 // Writes the bytes to the object if the object does not already exists.
 // Concurrency proof.
-func (g *GcsJwt) uploadObjectIfMissing(ctx context.Context, object string, bytes []byte) error {
+func (g *GcsJwt[T]) uploadObjectIfMissing(ctx context.Context, object string, bytes []byte) error {
 	// Create object handle
 	objHandle := g.bucketHandle.Object(object).If(storage.Conditions{DoesNotExist: true})
 
@@ -214,7 +198,7 @@ func (g *GcsJwt) uploadObjectIfMissing(ctx context.Context, object string, bytes
 }
 
 // Returns the rsa private keys for the given key ids. If the key does not exist, it will be created.
-func (g *GcsJwt) rsaKeys(ctx context.Context, keyIds []string) ([]*rsa.PrivateKey, error) {
+func (g *GcsJwt[T]) rsaKeys(ctx context.Context, keyIds []string) ([]*rsa.PrivateKey, error) {
 	keys := []*rsa.PrivateKey{}
 	for _, keyId := range keyIds {
 		// return from cache if exists

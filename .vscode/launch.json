@@ -6,8 +6,8 @@
 			"type": "go",
 			"request": "launch",
 			"mode": "debug",
-			"program": "/Users/daniel/acudac-com/packages/gcsjwt-go",
-			"envFile": "/Users/daniel/acudac-com/packages/gcsjwt-go/local.env",
+			"program": "/Users/daniel/acudac/public/gcsjwt-go",
+			"envFile": "/Users/daniel/acudac/public/local.env",
 		}
 	]
 }

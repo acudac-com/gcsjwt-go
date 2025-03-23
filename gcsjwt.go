@@ -24,6 +24,7 @@ var gcsClient *storage.Client
 // Uses Google Cloud Storage to store the 4096 bit private RSA keys.
 type GcsJwt[T jwt.Claims] struct {
 	bucketHandle *storage.BucketHandle
+	prefix       string
 	cachedKeys   *sync.Map
 	newClaims    func() T
 }
@@ -52,11 +53,21 @@ func New[T jwt.Claims](bucket string, newClaims func() T, opts ...option.ClientO
 	}
 
 	// Set the Storage client.
-	return &GcsJwt[T]{
+	gcsJwt := &GcsJwt[T]{
 		bucketHandle: gcsClient.Bucket(bucket),
 		cachedKeys:   &sync.Map{},
 		newClaims:    newClaims,
-	}, nil
+	}
+	if _, err := gcsJwt.PublicKeys(context.Background()); err != nil {
+		return nil, fmt.Errorf("failed to initialize keys: %w", err)
+	}
+	return gcsJwt, nil
+}
+
+// Uses the specified object prefix for the keys
+func (g *GcsJwt[T]) WithPrefix(prefix string) *GcsJwt[T] {
+	g.prefix = prefix
+	return g
 }
 
 // Returns a signed jwt token with the provided claims.
@@ -170,6 +181,9 @@ func (g *GcsJwt[T]) ParseCtx(ctx context.Context, key string) (T, error) {
 // Returns the bytes in the provided Google Cloud Storage object.
 func (g *GcsJwt[T]) readObject(ctx context.Context, object string) ([]byte, error) {
 	// Create reader
+	if g.prefix != "" {
+		object = g.prefix + "/" + object
+	}
 	reader, err := g.bucketHandle.Object(object).NewReader(ctx)
 	if err != nil {
 		return nil, err
@@ -184,6 +198,9 @@ func (g *GcsJwt[T]) readObject(ctx context.Context, object string) ([]byte, erro
 // Concurrency proof.
 func (g *GcsJwt[T]) uploadObjectIfMissing(ctx context.Context, object string, bytes []byte) error {
 	// Create object handle
+	if g.prefix != "" {
+		object = g.prefix + "/" + object
+	}
 	objHandle := g.bucketHandle.Object(object).If(storage.Conditions{DoesNotExist: true})
 
 	// Create writer

@@ -14,6 +14,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/golang-jwt/jwt"
+	"go.alis.build/alog"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/metadata"
 )
@@ -58,9 +59,12 @@ func New[T jwt.Claims](bucket string, newClaims func() T, opts ...option.ClientO
 		cachedKeys:   &sync.Map{},
 		newClaims:    newClaims,
 	}
-	if _, err := gcsJwt.PublicKeys(context.Background()); err != nil {
-		return nil, fmt.Errorf("failed to initialize keys: %w", err)
-	}
+	go func() {
+		ctx := context.Background()
+		if _, err := gcsJwt.PublicKeys(ctx); err != nil {
+			alog.Fatalf(ctx, "failed to initialize keys: %v", err)
+		}
+	}()
 	return gcsJwt, nil
 }
 
